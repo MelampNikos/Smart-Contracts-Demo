@@ -1,12 +1,9 @@
 pragma solidity ^0.8.0;
 
-/**
- * @title Escrow
- * @dev A multi-user escrow contract for a service rental marketplace (like Fiverr).
- * Sellers create service proposals, buyers make offers, sellers accept, then delivery flow.
- */
+import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
-contract Escrow {
+contract Escrow is EIP712 {
     enum ServiceState { OPEN, CLOSED }
     enum EscrowState { PENDING_ACCEPTANCE, AWAITING_DELIVERY, COMPLETE, REFUNDED, CANCELLED }
 
@@ -14,7 +11,7 @@ contract Escrow {
         address seller;
         string title;
         string description;
-        uint256 price;  // Suggested price (buyer can offer different amount)
+        uint256 price;
         ServiceState state;
         uint256 createdAt;
     }
@@ -34,9 +31,23 @@ contract Escrow {
     mapping(uint256 => Service) public services;
     mapping(uint256 => EscrowDetails) public escrows;
 
-    // Platform fee (e.g., 2.5% = 250 tokens out of 10000)
     address public owner;
-    uint256 public platformFeeTokens = 250; // 2.5%
+    uint256 public platformFeeTokens = 250;
+
+    // EIP-712 type hashes
+    bytes32 private constant OFFER_TYPEHASH =
+        keccak256("Offer(uint256 serviceId,uint256 amount,address buyer,address seller,uint256 nonce,uint256 deadline,string buyerMessage)");
+    
+    bytes32 private constant ACCEPT_OFFER_TYPEHASH =
+        keccak256("AcceptOffer(uint256 escrowId,address seller,uint256 nonce,uint256 deadline)");
+    
+    bytes32 private constant APPROVE_DELIVERY_TYPEHASH =
+        keccak256("ApproveDelivery(uint256 escrowId,address buyer,uint256 nonce,uint256 deadline)");
+    
+    bytes32 private constant CANCEL_OFFER_TYPEHASH =
+        keccak256("CancelOffer(uint256 escrowId,address buyer,uint256 nonce,uint256 deadline)");
+
+    mapping(address => uint256) public nonces;
 
     // Events for services
     event ServiceCreated(uint256 indexed serviceId, address indexed seller, string title, uint256 price);
@@ -50,19 +61,17 @@ contract Escrow {
     event FundsReleased(uint256 indexed escrowId, uint256 sellerAmount, uint256 platformFee);
     event Refunded(uint256 indexed escrowId, uint256 amount);
 
-    constructor() {
+    constructor() EIP712("Escrow", "1") {
         owner = msg.sender;
     }
 
     modifier onlyOwner() {
-        require(msg.sender == owner, "Only owner can call this");
+        require(msg.sender == owner);
         _;
     }
 
-
     function createService(string calldata _title, string calldata _description, uint256 _price) external returns (uint256) {
-        require(bytes(_title).length > 0, "Title required");
-        require(_price > 0, "Price must be greater than 0");
+        require(_price > 0);
 
         uint256 serviceId = serviceCount++;
         
@@ -79,25 +88,20 @@ contract Escrow {
         return serviceId;
     }
 
-    // Seller can close their service (no new offers)
     function closeService(uint256 _serviceId) external {
         Service storage service = services[_serviceId];
-        require(msg.sender == service.seller, "Only seller can close");
-        require(service.state == ServiceState.OPEN, "Service not open");
+        require(msg.sender == service.seller);
+        require(service.state == ServiceState.OPEN);
         
         service.state = ServiceState.CLOSED;
         emit ServiceClosed(_serviceId);
     }
 
-    // ==================== ESCROW FUNCTIONS ====================
-
-    // Buyer makes an offer on a service (funds are held in escrow)
     function makeOffer(uint256 _serviceId, string calldata _message) external payable returns (uint256) {
         Service storage service = services[_serviceId];
-        require(service.seller != address(0), "Service does not exist");
-        require(service.state == ServiceState.OPEN, "Service not available");
-        require(msg.sender != service.seller, "Seller cannot buy own service");
-        require(msg.value > 0, "Must send payment");
+        require(service.state == ServiceState.OPEN);
+        require(msg.sender != service.seller);
+        require(msg.value > 0);
 
         uint256 escrowId = escrowCount++;
         
@@ -115,21 +119,19 @@ contract Escrow {
         return escrowId;
     }
 
-    // Seller accepts the offer - work begins
     function acceptOffer(uint256 _escrowId) external {
         EscrowDetails storage escrow = escrows[_escrowId];
-        require(msg.sender == escrow.seller, "Only seller can accept");
-        require(escrow.state == EscrowState.PENDING_ACCEPTANCE, "Invalid state");
+        require(msg.sender == escrow.seller);
+        require(escrow.state == EscrowState.PENDING_ACCEPTANCE);
 
         escrow.state = EscrowState.AWAITING_DELIVERY;
         emit OfferAccepted(_escrowId);
     }
 
-    // Seller rejects the offer - funds returned to buyer
     function rejectOffer(uint256 _escrowId) external {
         EscrowDetails storage escrow = escrows[_escrowId];
-        require(msg.sender == escrow.seller, "Only seller can reject");
-        require(escrow.state == EscrowState.PENDING_ACCEPTANCE, "Invalid state");
+        require(msg.sender == escrow.seller);
+        require(escrow.state == EscrowState.PENDING_ACCEPTANCE);
 
         escrow.state = EscrowState.REFUNDED;
         uint256 refundAmount = escrow.amount;
@@ -141,11 +143,10 @@ contract Escrow {
         emit Refunded(_escrowId, refundAmount);
     }
 
-    // Buyer can cancel their offer before seller accepts
     function cancelOffer(uint256 _escrowId) external {
         EscrowDetails storage escrow = escrows[_escrowId];
-        require(msg.sender == escrow.buyer, "Only buyer can cancel");
-        require(escrow.state == EscrowState.PENDING_ACCEPTANCE, "Cannot cancel after acceptance");
+        require(msg.sender == escrow.buyer);
+        require(escrow.state == EscrowState.PENDING_ACCEPTANCE);
 
         escrow.state = EscrowState.CANCELLED;
         uint256 refundAmount = escrow.amount;
@@ -156,20 +157,17 @@ contract Escrow {
         emit Refunded(_escrowId, refundAmount);
     }
 
-    // Buyer approves the delivery and releases funds to seller
     function approveDelivery(uint256 _escrowId) external {
         EscrowDetails storage escrow = escrows[_escrowId];
-        require(msg.sender == escrow.buyer, "Only the buyer can approve");
-        require(escrow.state == EscrowState.AWAITING_DELIVERY, "Invalid state");
+        require(msg.sender == escrow.buyer);
+        require(escrow.state == EscrowState.AWAITING_DELIVERY);
 
         escrow.state = EscrowState.COMPLETE;
 
-        // Calculate platform fee
         uint256 platformFee = (escrow.amount * platformFeeTokens) / 10000;
         uint256 sellerAmount = escrow.amount - platformFee;
         escrow.amount = 0;
 
-        // Transfer funds
         payable(escrow.seller).transfer(sellerAmount);
         if (platformFee > 0) {
             payable(owner).transfer(platformFee);
@@ -179,11 +177,10 @@ contract Escrow {
         emit FundsReleased(_escrowId, sellerAmount, platformFee);
     }
 
-    // Buyer requests refund if something goes wrong (after acceptance)
     function requestRefund(uint256 _escrowId) external {
         EscrowDetails storage escrow = escrows[_escrowId];
-        require(msg.sender == escrow.buyer, "Only the buyer can request refund");
-        require(escrow.state == EscrowState.AWAITING_DELIVERY, "Invalid state");
+        require(msg.sender == escrow.buyer);
+        require(escrow.state == EscrowState.AWAITING_DELIVERY);
 
         escrow.state = EscrowState.REFUNDED;
         uint256 refundAmount = escrow.amount;
@@ -194,15 +191,10 @@ contract Escrow {
         emit Refunded(_escrowId, refundAmount);
     }
 
-    // ==================== ADMIN FUNCTIONS ====================
-
-    // Owner can update platform fee
     function setPlatformFee(uint256 _feeTokens) external onlyOwner {
-        require(_feeTokens <= 1000, "Fee cannot exceed 10%");
+        require(_feeTokens <= 1000);
         platformFeeTokens = _feeTokens;
     }
-
-    // ==================== VIEW FUNCTIONS ====================
 
     function getService(uint256 _serviceId) external view returns (Service memory) {
         return services[_serviceId];
@@ -212,7 +204,6 @@ contract Escrow {
         return escrows[_escrowId];
     }
 
-    // Get all services by a seller
     function getSellerServices(address _seller) external view returns (uint256[] memory) {
         uint256 count = 0;
         for (uint256 i = 0; i < serviceCount; i++) {
@@ -229,7 +220,6 @@ contract Escrow {
         return result;
     }
 
-    // Get all open services
     function getOpenServices() external view returns (uint256[] memory) {
         uint256 count = 0;
         for (uint256 i = 0; i < serviceCount; i++) {
@@ -246,7 +236,6 @@ contract Escrow {
         return result;
     }
 
-    // Get all escrows for a buyer
     function getBuyerEscrows(address _buyer) external view returns (uint256[] memory) {
         uint256 count = 0;
         for (uint256 i = 0; i < escrowCount; i++) {
@@ -263,7 +252,6 @@ contract Escrow {
         return result;
     }
 
-    // Get all escrows for a seller
     function getSellerEscrows(address _seller) external view returns (uint256[] memory) {
         uint256 count = 0;
         for (uint256 i = 0; i < escrowCount; i++) {
@@ -280,7 +268,6 @@ contract Escrow {
         return result;
     }
 
-    // Get escrows for a specific service
     function getServiceEscrows(uint256 _serviceId) external view returns (uint256[] memory) {
         uint256 count = 0;
         for (uint256 i = 0; i < escrowCount; i++) {
@@ -295,5 +282,226 @@ contract Escrow {
             }
         }
         return result;
+    }
+
+    function verifyOfferSignature(
+        uint256 serviceId,
+        uint256 amount,
+        address buyer,
+        address seller,
+        uint256 nonce,
+        uint256 deadline,
+        string calldata buyerMessage,
+        bytes calldata signature
+    ) public view returns (address) {
+        require(block.timestamp <= deadline);
+        
+        bytes32 structHash = keccak256(abi.encode(
+            OFFER_TYPEHASH,
+            serviceId,
+            amount,
+            buyer,
+            seller,
+            nonce,
+            deadline,
+            keccak256(bytes(buyerMessage))
+        ));
+        
+        bytes32 digest = _hashTypedDataV4(structHash);
+        return ECDSA.recover(digest, signature);
+    }
+
+    function verifyAcceptOfferSignature(
+        uint256 escrowId,
+        address seller,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata signature
+    ) public view returns (address) {
+        require(block.timestamp <= deadline);
+        
+        bytes32 structHash = keccak256(abi.encode(
+            ACCEPT_OFFER_TYPEHASH,
+            escrowId,
+            seller,
+            nonce,
+            deadline
+        ));
+        
+        bytes32 digest = _hashTypedDataV4(structHash);
+        return ECDSA.recover(digest, signature);
+    }
+
+    function verifyApproveDeliverySignature(
+        uint256 escrowId,
+        address buyer,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata signature
+    ) public view returns (address) {
+        require(block.timestamp <= deadline);
+        
+        bytes32 structHash = keccak256(abi.encode(
+            APPROVE_DELIVERY_TYPEHASH,
+            escrowId,
+            buyer,
+            nonce,
+            deadline
+        ));
+        
+        bytes32 digest = _hashTypedDataV4(structHash);
+        return ECDSA.recover(digest, signature);
+    }
+
+    function verifyCancelOfferSignature(
+        uint256 escrowId,
+        address buyer,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata signature
+    ) public view returns (address) {
+        require(block.timestamp <= deadline);
+        
+        bytes32 structHash = keccak256(abi.encode(
+            CANCEL_OFFER_TYPEHASH,
+            escrowId,
+            buyer,
+            nonce,
+            deadline
+        ));
+        
+        bytes32 digest = _hashTypedDataV4(structHash);
+        return ECDSA.recover(digest, signature);
+    }
+
+    function makeOfferWithSignature(
+        uint256 _serviceId,
+        string calldata _message,
+        uint256 deadline,
+        bytes calldata signature
+    ) external payable returns (uint256) {
+        Service storage service = services[_serviceId];
+        require(service.state == ServiceState.OPEN);
+        require(msg.value > 0);
+
+        address buyer = verifyOfferSignature(
+            _serviceId,
+            msg.value,
+            msg.sender,
+            service.seller,
+            nonces[msg.sender],
+            deadline,
+            _message,
+            signature
+        );
+        
+        require(buyer == msg.sender);
+        require(msg.sender != service.seller);
+        
+        nonces[msg.sender]++;
+
+        uint256 escrowId = escrowCount++;
+        
+        escrows[escrowId] = EscrowDetails({
+            serviceId: _serviceId,
+            buyer: msg.sender,
+            seller: service.seller,
+            amount: msg.value,
+            state: EscrowState.PENDING_ACCEPTANCE,
+            buyerMessage: _message,
+            createdAt: block.timestamp
+        });
+
+        emit OfferMade(escrowId, _serviceId, msg.sender, msg.value);
+        return escrowId;
+    }
+
+    function acceptOfferWithSignature(
+        uint256 _escrowId,
+        uint256 deadline,
+        bytes calldata signature
+    ) external {
+        EscrowDetails storage escrow = escrows[_escrowId];
+        require(escrow.state == EscrowState.PENDING_ACCEPTANCE);
+
+        address seller = verifyAcceptOfferSignature(
+            _escrowId,
+            escrow.seller,
+            nonces[escrow.seller],
+            deadline,
+            signature
+        );
+        
+        require(seller == escrow.seller);
+        
+        nonces[escrow.seller]++;
+
+        escrow.state = EscrowState.AWAITING_DELIVERY;
+        emit OfferAccepted(_escrowId);
+    }
+
+    function approveDeliveryWithSignature(
+        uint256 _escrowId,
+        uint256 deadline,
+        bytes calldata signature
+    ) external {
+        EscrowDetails storage escrow = escrows[_escrowId];
+        require(escrow.state == EscrowState.AWAITING_DELIVERY);
+
+        address buyer = verifyApproveDeliverySignature(
+            _escrowId,
+            escrow.buyer,
+            nonces[escrow.buyer],
+            deadline,
+            signature
+        );
+        
+        require(buyer == escrow.buyer);
+        
+        nonces[escrow.buyer]++;
+
+
+        escrow.state = EscrowState.COMPLETE;
+
+        uint256 platformFee = (escrow.amount * platformFeeTokens) / 10000;
+        uint256 sellerAmount = escrow.amount - platformFee;
+        escrow.amount = 0;
+
+        payable(escrow.seller).transfer(sellerAmount);
+        if (platformFee > 0) {
+            payable(owner).transfer(platformFee);
+        }
+
+        emit DeliveryApproved(_escrowId);
+        emit FundsReleased(_escrowId, sellerAmount, platformFee);
+    }
+
+    function cancelOfferWithSignature(
+        uint256 _escrowId,
+        uint256 deadline,
+        bytes calldata signature
+    ) external {
+        EscrowDetails storage escrow = escrows[_escrowId];
+        require(escrow.state == EscrowState.PENDING_ACCEPTANCE);
+
+        address buyer = verifyCancelOfferSignature(
+            _escrowId,
+            escrow.buyer,
+            nonces[escrow.buyer],
+            deadline,
+            signature
+        );
+        
+        require(buyer == escrow.buyer);
+        
+        nonces[escrow.buyer]++;
+
+        escrow.state = EscrowState.CANCELLED;
+        uint256 refundAmount = escrow.amount;
+        escrow.amount = 0;
+
+        payable(escrow.buyer).transfer(refundAmount);
+
+        emit Refunded(_escrowId, refundAmount);
     }
 }
