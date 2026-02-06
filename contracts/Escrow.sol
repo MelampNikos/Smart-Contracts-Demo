@@ -17,13 +17,16 @@ contract Escrow is EIP712 {
     }
 
     struct EscrowDetails {
+        uint256 id;
         uint256 serviceId;
         address buyer;
         address seller;
         uint256 amount;
         EscrowState state;
         string buyerMessage;
-        uint256 createdAt;
+        uint256 createdAt;          // When offer was created
+        uint256 deadline;      // Buyer-proposed ETA (timestamp)
+        uint256 acceptedAt;    // When seller accepted the offer
     }
 
     uint256 public serviceCount;
@@ -55,11 +58,12 @@ contract Escrow is EIP712 {
 
     // Events for escrows
     event OfferMade(uint256 indexed escrowId, uint256 indexed serviceId, address indexed buyer, uint256 amount);
-    event OfferAccepted(uint256 indexed escrowId);
+    event OfferAccepted(uint256 indexed escrowId, uint256 deadline);
     event OfferRejected(uint256 indexed escrowId);
     event DeliveryApproved(uint256 indexed escrowId);
     event FundsReleased(uint256 indexed escrowId, uint256 sellerAmount, uint256 platformFee);
     event Refunded(uint256 indexed escrowId, uint256 amount);
+    event DeadlineExpired(uint256 indexed escrowId);
 
     constructor() EIP712("Escrow", "1") {
         owner = msg.sender;
@@ -97,35 +101,43 @@ contract Escrow is EIP712 {
         emit ServiceClosed(_serviceId);
     }
 
-    function makeOffer(uint256 _serviceId, string calldata _message) external payable returns (uint256) {
+    function makeOffer(uint256 _serviceId, string calldata _message, uint256 _deadline) external payable returns (uint256) {
         Service storage service = services[_serviceId];
-        require(service.state == ServiceState.OPEN);
-        require(msg.sender != service.seller);
-        require(msg.value > 0);
+        require(service.seller != address(0), "Service does not exist");
+        require(service.state == ServiceState.OPEN, "Service not available");
+        require(msg.sender != service.seller, "Seller cannot buy own service");
+        require(msg.value > 0, "Must send payment");
+        require(_deadline > block.timestamp, "Deadline must be in the future");
 
         uint256 escrowId = escrowCount++;
         
         escrows[escrowId] = EscrowDetails({
+            id: escrowId,
             serviceId: _serviceId,
             buyer: msg.sender,
             seller: service.seller,
             amount: msg.value,
             state: EscrowState.PENDING_ACCEPTANCE,
             buyerMessage: _message,
-            createdAt: block.timestamp
+            createdAt: block.timestamp,
+            deadline: _deadline,
+            acceptedAt: 0
         });
 
         emit OfferMade(escrowId, _serviceId, msg.sender, msg.value);
         return escrowId;
     }
 
+    // Seller accepts the offer - work begins 
     function acceptOffer(uint256 _escrowId) external {
         EscrowDetails storage escrow = escrows[_escrowId];
-        require(msg.sender == escrow.seller);
-        require(escrow.state == EscrowState.PENDING_ACCEPTANCE);
+        require(msg.sender == escrow.seller, "Only seller can accept");
+        require(escrow.state == EscrowState.PENDING_ACCEPTANCE, "Invalid state");
+        require(escrow.deadline > block.timestamp, "Deadline has already passed");
 
         escrow.state = EscrowState.AWAITING_DELIVERY;
-        emit OfferAccepted(_escrowId);
+        escrow.acceptedAt = block.timestamp;
+        emit OfferAccepted(_escrowId, escrow.deadline);
     }
 
     function rejectOffer(uint256 _escrowId) external {
@@ -188,6 +200,22 @@ contract Escrow is EIP712 {
 
         payable(escrow.buyer).transfer(refundAmount);
 
+        emit Refunded(_escrowId, refundAmount);
+    }
+
+    // Anyone can trigger refund if deadline has passed (usually buyer calls this)
+    function claimRefundAfterDeadline(uint256 _escrowId) external {
+        EscrowDetails storage escrow = escrows[_escrowId];
+        require(escrow.state == EscrowState.AWAITING_DELIVERY, "Invalid state");
+        require(block.timestamp > escrow.deadline, "Deadline has not passed yet");
+
+        escrow.state = EscrowState.REFUNDED;
+        uint256 refundAmount = escrow.amount;
+        escrow.amount = 0;
+
+        payable(escrow.buyer).transfer(refundAmount);
+
+        emit DeadlineExpired(_escrowId);
         emit Refunded(_escrowId, refundAmount);
     }
 
